@@ -1,0 +1,476 @@
+﻿#Requires -Version 5.0
+<#
+.SYNOPSIS
+  Dev Mover GUI (WPF, light theme) - graphical wizard host.
+
+.DESCRIPTION
+  Loads DevMover-GUI.xaml via XamlReader and drives the UI. All migration
+  logic stays in dev-mover.ps1 (the engine), which is invoked inside an
+  in-process PowerShell runspace; output is streamed back to the log box
+  asynchronously so the UI never freezes.
+
+  Features:
+    - default source folders for TRAE CN / WorkBuddy / VS Code / Claude Code
+      plus custom source paths
+    - target drive/folder with live preview
+    - backup / auto-close / dry-run options
+    - start / restore / exit actions
+    - controls disabled while running, window close blocked while running
+    - -SelfTest prints control/source/drive checks and exits
+
+.PARAMETER SelfTest
+  Print a baseline check (XAML load, controls, sources, drives) and exit.
+
+.PARAMETER TestMode
+  Testing/screenshot helper only: passes -SkipProcessCheck to the engine so
+  dry-run / migration tests can run while apps are open. Never used by end users.
+#>
+param(
+    [switch]$SelfTest,
+    [switch]$TestMode
+)
+
+Add-Type -AssemblyName PresentationFramework
+Add-Type -AssemblyName PresentationCore
+Add-Type -AssemblyName WindowsBase
+Add-Type -AssemblyName System.Xaml
+
+$script:Version = '1.0.0'
+$script:EnginePath = Join-Path $PSScriptRoot 'dev-mover.ps1'
+$script:XamlPath = Join-Path $PSScriptRoot 'DevMover-GUI.xaml'
+$script:Window = $null
+$script:running = $false
+$script:IsRestore = $false
+$script:IsDryRun = $false
+$script:EngineProcess = $null
+$script:EnginePS = $null
+$script:EngineAsync = $null
+$script:EngineTimer = $null
+$script:DebugLog = Join-Path $env:TEMP 'devmover-debug.log'
+$script:ControlNames = @(
+    'SrcList','TxtCustom','BtnRefresh','BtnAdd',
+    'DriveCombo','FolderBox','LblRoot',
+    'CbBackup','CbAutoClose','CbDryRun',
+    'BtnGo','BtnRestore','BtnExit',
+    'LogBox','StatusText','StatusChip','ProgressBar'
+)
+
+function Write-DebugLog {
+    param([string]$Message)
+    try {
+        Add-Content -LiteralPath $script:DebugLog -Value ('{0}  {1}' -f (Get-Date -Format 'HH:mm:ss.fff'), $Message) -Encoding UTF8
+    } catch { }
+}
+
+try { Clear-Content -LiteralPath $script:DebugLog -ErrorAction SilentlyContinue } catch { }
+Write-DebugLog ('GUI v{0} start (SelfTest={1} TestMode={2})' -f $script:Version, $SelfTest, $TestMode)
+
+function Get-DefaultSources {
+    $specs = @(
+        @{ App = 'TRAE CN';     Path = Join-Path $env:APPDATA 'Trae CN';                  Name = 'TraeCN-Roaming' }
+        @{ App = 'TRAE CN';     Path = Join-Path $env:USERPROFILE '.trae';                Name = '.trae' }
+        @{ App = 'WorkBuddy';   Path = Join-Path $env:USERPROFILE 'Tencent WorkBuddy';    Name = 'Tencent-WorkBuddy' }
+        @{ App = 'WorkBuddy';   Path = Join-Path $env:APPDATA 'CodeBuddyExtension';      Name = 'CodeBuddyExtension-Roaming' }
+        @{ App = 'VS Code';     Path = Join-Path $env:APPDATA 'Code';                     Name = 'VSCode-Roaming' }
+        @{ App = 'VS Code';     Path = Join-Path $env:USERPROFILE '.vscode';               Name = '.vscode' }
+        @{ App = 'Claude Code'; Path = Join-Path $env:USERPROFILE '.claude';               Name = '.claude' }
+        @{ App = 'Claude Code'; Path = Join-Path $env:USERPROFILE '.local\share\claude';   Name = 'local-share-claude' }
+    )
+    $result = @()
+    foreach ($s in $specs) {
+        $sizeMB = $null
+        $exists = $false
+        $isJunction = $false
+        $item = Get-Item -LiteralPath $s.Path -Force -ErrorAction SilentlyContinue
+        if ($item) {
+            $exists = $true
+            if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { $isJunction = $true }
+            $bytes = (Get-ChildItem -LiteralPath $s.Path -Recurse -Force -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
+            if ($bytes) { $sizeMB = [math]::Round($bytes / 1MB, 1) }
+        }
+        $state = if (-not $exists) { '不存在' } elseif ($isJunction) { '已迁移(联接)' } else { ('{0} MB' -f $sizeMB) }
+        $obj = [PSCustomObject]@{
+            App = $s.App
+            Path = $s.Path
+            Name = $s.Name
+            Exists = $exists
+            IsJunction = $isJunction
+            SizeMB = $sizeMB
+            Label = ('{0} — {1}  [{2}]' -f $s.App, $s.Path, $state)
+        }
+        $result += $obj
+    }
+    return $result
+}
+
+function Get-FixedDrives {
+    return @([System.IO.DriveInfo]::GetDrives() | Where-Object { $_.IsReady -and $_.DriveType -eq [System.IO.DriveType]::Fixed } | ForEach-Object {
+        [PSCustomObject]@{
+            Root = $_.Name
+            FreeGB = [math]::Round($_.AvailableFreeSpace / 1GB, 1)
+            TotalGB = [math]::Round($_.TotalSize / 1GB, 1)
+            Label = ('{0}  (free {1} GB / {2} GB)' -f $_.Name, [math]::Round($_.AvailableFreeSpace / 1GB, 1), [math]::Round($_.TotalSize / 1GB, 1))
+        }
+    })
+}
+
+function Load-Window {
+    if (-not (Test-Path -LiteralPath $script:XamlPath)) {
+        throw "找不到界面文件: $($script:XamlPath)"
+    }
+    $stream = [System.IO.File]::OpenRead($script:XamlPath)
+    try {
+        $script:Window = [System.Windows.Markup.XamlReader]::Load($stream)
+    } finally {
+        $stream.Close()
+    }
+    if (-not $script:Window) { throw 'XAML 加载失败: XamlReader 返回空对象' }
+    Write-DebugLog 'XAML loaded'
+    foreach ($n in $script:ControlNames) {
+        $ctl = $script:Window.FindName($n)
+        if (-not $ctl) { throw "XAML 缺少控件: $n" }
+        Set-Variable -Name $n -Value $ctl -Scope Script
+    }
+}
+
+function Append-Log {
+    param([string]$Text)
+    if (-not $script:LogBox) { return }
+    if ($script:LogBox.Dispatcher.CheckAccess()) {
+        $script:LogBox.AppendText($Text + [Environment]::NewLine)
+        $script:LogBox.ScrollToEnd()
+    } else {
+        $script:LogBox.Dispatcher.Invoke([Action[string]]{
+            param($t)
+            $script:LogBox.AppendText($t + [Environment]::NewLine)
+            $script:LogBox.ScrollToEnd()
+        }, $Text) | Out-Null
+    }
+}
+
+function Set-Status {
+    param([string]$Text, [string]$Kind = 'ok')
+    $map = @{ ok = 'SuccessBrush'; run = 'AccentBrush'; err = 'DangerBrush'; warn = 'WarnBrush' }
+    $key = if ($map.ContainsKey($Kind)) { $map[$Kind] } else { 'TextSecondaryBrush' }
+    $brush = $script:Window.TryFindResource($key)
+    if (-not $brush) { $brush = $script:Window.TryFindResource('TextSecondaryBrush') }
+    $chipBg = $brush.Clone()
+    $chipBg.Opacity = 0.18
+    $script:StatusText.Text = $Text
+    $script:StatusText.Foreground = $brush
+    $script:StatusChip.Background = $chipBg
+}
+
+function Set-ProgressState {
+    param([bool]$Visible)
+    $script:ProgressBar.Visibility = if ($Visible) { [System.Windows.Visibility]::Visible } else { [System.Windows.Visibility]::Collapsed }
+}
+
+function Update-RootPreview {
+    $root = ''
+    if ($script:DriveCombo.SelectedItem) { $root = $script:DriveCombo.SelectedItem.Root.TrimEnd('\') }
+    $folder = $script:FolderBox.Text.Trim()
+    if ($root -and $folder) { $script:LblRoot.Text = ('迁移目标: {0}\{1}' -f $root, $folder) } else { $script:LblRoot.Text = '迁移目标: (请选择盘符和文件夹)' }
+}
+
+function New-SourceCheckBox {
+    param($Source, [bool]$Checked)
+    $cb = New-Object System.Windows.Controls.CheckBox
+    $cb.Content = $Source.Label
+    $cb.Tag = $Source
+    $cb.IsChecked = $Checked
+    $cb.FontSize = 13
+    $cb.Foreground = $script:Window.TryFindResource('TextPrimaryBrush')
+    $cb.Margin = New-Object System.Windows.Thickness(0, 4, 0, 4)
+    $cb.Cursor = [System.Windows.Input.Cursors]::Hand
+    return $cb
+}
+
+function Refresh-Sources {
+    $checkedPaths = @($script:SrcList.Items | Where-Object { $_.IsChecked -eq $true } | ForEach-Object { $_.Tag.Path })
+    $script:SrcList.Items.Clear()
+    foreach ($s in (Get-DefaultSources)) {
+        $checked = ($checkedPaths -contains $s.Path) -or ($s.Exists -and -not $s.IsJunction)
+        [void]$script:SrcList.Items.Add((New-SourceCheckBox -Source $s -Checked $checked))
+    }
+}
+
+function Set-ControlsEnabled {
+    param([bool]$Enabled)
+    $script:BtnGo.IsEnabled = $Enabled
+    $script:BtnRestore.IsEnabled = $Enabled
+    $script:BtnRefresh.IsEnabled = $Enabled
+    $script:BtnAdd.IsEnabled = $Enabled
+    $script:SrcList.IsEnabled = $Enabled
+    $script:DriveCombo.IsEnabled = $Enabled
+    $script:FolderBox.IsEnabled = $Enabled
+    $script:CbBackup.IsEnabled = $Enabled
+    $script:CbAutoClose.IsEnabled = $Enabled
+    $script:CbDryRun.IsEnabled = $Enabled
+}
+
+function Build-SourcesFile {
+    $map = @{}
+    foreach ($item in $script:SrcList.Items) {
+        if ($item.IsChecked -eq $true) { $map[$item.Tag.Path] = $item.Tag.Name }
+    }
+    if ($map.Count -eq 0) { return $null }
+    $jsonPath = Join-Path $env:TEMP ('devmover-sources-{0}.json' -f $PID)
+    $map | ConvertTo-Json | Set-Content -LiteralPath $jsonPath -Encoding UTF8
+    return $jsonPath
+}
+
+function Complete-Run {
+    param([int]$ExitCode)
+    Write-DebugLog ("Complete-Run called, code={0}" -f $ExitCode)
+    $script:running = $false
+    Set-ControlsEnabled $true
+    Set-ProgressState $false
+    if ($ExitCode -eq 0) {
+        Set-Status '完成' 'ok'
+        if (-not $script:IsRestore -and -not $script:IsDryRun) {
+            [System.Windows.MessageBox]::Show('迁移完成。可以重新打开 TRAE CN、WorkBuddy、VS Code 和 Claude Code 了。' + [Environment]::NewLine + '备份保留在目标盘 _backup-* 文件夹中，建议保留几天再删除。', '完成', [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null
+        }
+    } else {
+        Set-Status '未完成，请查看日志' 'err'
+        [System.Windows.MessageBox]::Show('迁移未完成（退出码 ' + $ExitCode + '）。' + [Environment]::NewLine + '数据没有丢失，请查看日志。', '注意', [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null
+    }
+}
+
+function Invoke-EngineAsync {
+    param([string]$ArgumentList)
+    Append-Log ''
+    Append-Log ('> dev-mover.ps1 ' + $ArgumentList)
+    # Run the engine inside this process (PowerShell runspace) instead of
+    # spawning a hidden powershell.exe child. Spawning hidden child processes
+    # with redirected IO can be blocked/killed by security software on some
+    # machines, which caused the GUI window to vanish. A runspace streams the
+    # engine output asynchronously without any child process.
+    try {
+        $engineScript = "& '" + $script:EnginePath + "' " + $ArgumentList
+        $ps = [System.Management.Automation.PowerShell]::Create()
+        [void]$ps.AddScript($engineScript)
+        $infoHandler = {
+            param($sender, $e)
+            try {
+                $item = $sender[$e.Index]
+                if ($item -and $item.MessageData) { Append-Log ([string]$item.MessageData) }
+            } catch { }
+        }
+        $errHandler = {
+            param($sender, $e)
+            try {
+                $item = $sender[$e.Index]
+                if ($item) { Append-Log ('[ERR] ' + $item.ToString()) }
+            } catch { }
+        }
+        $ps.Streams.Information.add_DataAdded($infoHandler)
+        $ps.Streams.Error.add_DataAdded($errHandler)
+        $script:EnginePS = $ps
+        $script:EngineAsync = $ps.BeginInvoke()
+        Write-DebugLog 'engine started (in-process runspace)'
+        $timer = New-Object System.Windows.Threading.DispatcherTimer
+        $timer.Interval = [TimeSpan]::FromMilliseconds(250)
+        $timer.Add_Tick({
+            param($sender, $e)
+            try {
+                if ($script:EngineAsync -and $script:EngineAsync.IsCompleted) {
+                    try { $sender.Stop() } catch { }
+                    $code = 0
+                    try {
+                        $null = $script:EnginePS.EndInvoke($script:EngineAsync)
+                    } catch {
+                        $code = 1
+                        Append-Log ('[ERR] 引擎异常: ' + $_.Exception.Message)
+                        Write-DebugLog ('engine EXCEPTION: ' + $_.Exception.Message)
+                    }
+                    # engine uses `exit N` for failures; derive the outcome from its summary too
+                    $logTail = ''
+                    if ($script:LogBox) { $logTail = $script:LogBox.Text }
+                    if ($logTail -match 'Some items failed|FAILED:|ABORT:') { $code = 1 }
+                    elseif ($logTail -match 'All done\.|Dry run - no changes were made\.') { $code = 0 }
+                    Write-DebugLog ("engine finished, code={0}" -f $code)
+                    $script:EngineAsync = $null
+                    Complete-Run -ExitCode $code
+                }
+            } catch {
+                # never leave the window stuck in "running" state
+                Write-DebugLog ('timer tick EXCEPTION: ' + $_.Exception.Message)
+                try { $sender.Stop() } catch { }
+                $script:running = $false
+                try { Set-ControlsEnabled $true } catch { }
+                try { Set-ProgressState $false } catch { }
+                Set-Status '未完成，请查看日志' 'err'
+            }
+        })
+        $timer.Start()
+        $script:EngineTimer = $timer
+    } catch {
+        Append-Log ('启动失败: ' + $_.Exception.Message)
+        Write-DebugLog ('engine start FAILED: ' + $_.Exception.Message)
+        Set-Status '未完成，请查看日志' 'err'
+        Set-ControlsEnabled $true
+        Set-ProgressState $false
+        $script:running = $false
+    }
+}
+
+function Start-Migration {
+    param([bool]$AsRestore)
+    try {
+        Write-DebugLog ("click start (restore={0})" -f $AsRestore)
+        if ($script:running) { return }
+        if (-not (Test-Path -LiteralPath $script:EnginePath)) {
+            [System.Windows.MessageBox]::Show('找不到引擎脚本 dev-mover.ps1', '错误', [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error) | Out-Null
+            return
+        }
+        $root = ''
+        if ($script:DriveCombo.SelectedItem) { $root = $script:DriveCombo.SelectedItem.Root.TrimEnd('\') }
+        $folder = $script:FolderBox.Text.Trim()
+        if (-not $root -or -not $folder) {
+            [System.Windows.MessageBox]::Show('请先选择目标盘并填写文件夹名', '提示', [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null
+            return
+        }
+        $targetRoot = '{0}\{1}' -f $root, $folder
+
+        if (-not $AsRestore) {
+            $jsonPath = Build-SourcesFile
+            if (-not $jsonPath) {
+                [System.Windows.MessageBox]::Show('请至少勾选一个要迁移的目录', '提示', [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null
+                return
+            }
+            if (-not $script:CbDryRun.IsChecked) {
+                $answer = [System.Windows.MessageBox]::Show('确定开始迁移到 ' + $targetRoot + ' 吗？' + [Environment]::NewLine + '请确认已完全退出 TRAE CN、WorkBuddy、VS Code 和 Claude Code（或勾选了自动关闭）。', '确认', [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Question)
+                if ($answer -ne [System.Windows.MessageBoxResult]::Yes) { return }
+            }
+            $args = '-TargetRoot "' + $targetRoot + '" -SourcesFile "' + $jsonPath + '"'
+            if (-not $script:CbBackup.IsChecked) { $args += ' -Backup:$false' }
+            if ($script:CbAutoClose.IsChecked) { $args += ' -AutoCloseYes' }
+            if ($script:CbDryRun.IsChecked) { $args += ' -DryRun -SkipProcessCheck' }
+        } else {
+            $answer = [System.Windows.MessageBox]::Show('确定要从 ' + $targetRoot + ' 的最新备份恢复吗？', '确认', [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Question)
+            if ($answer -ne [System.Windows.MessageBoxResult]::Yes) { return }
+            $args = '-TargetRoot "' + $targetRoot + '" -Restore'
+        }
+
+        if ($TestMode) { $args += ' -SkipProcessCheck' }
+
+        $script:IsRestore = $AsRestore
+        $script:IsDryRun = [bool]$script:CbDryRun.IsChecked
+        Write-DebugLog ("engine args: {0}" -f $args)
+        $script:running = $true
+        Set-ControlsEnabled $false
+        Set-ProgressState $true
+        Set-Status '运行中…' 'run'
+        Invoke-EngineAsync -ArgumentList $args
+    } catch {
+        Write-DebugLog ('Start-Migration EXCEPTION: ' + $_.Exception.Message)
+        $script:running = $false
+        try { Set-ControlsEnabled $true } catch { }
+        try { Set-ProgressState $false } catch { }
+        [System.Windows.MessageBox]::Show('操作失败: ' + $_.Exception.Message, '错误', [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error) | Out-Null
+    }
+}
+
+function Init-UI {
+    Refresh-Sources
+    $script:DriveCombo.Items.Clear()
+    foreach ($d in (Get-FixedDrives)) { [void]$script:DriveCombo.Items.Add($d) }
+    $systemRoot = (Split-Path -Qualifier $env:SystemDrive).TrimEnd(':')
+    for ($i = 0; $i -lt $script:DriveCombo.Items.Count; $i++) {
+        if ($script:DriveCombo.Items[$i].Root.TrimEnd('\') -ne $systemRoot) { $script:DriveCombo.SelectedIndex = $i; break }
+    }
+    if ($script:DriveCombo.SelectedIndex -lt 0 -and $script:DriveCombo.Items.Count -gt 0) { $script:DriveCombo.SelectedIndex = 0 }
+    Update-RootPreview
+    Set-Status '就绪' 'ok'
+}
+
+# ---- SelfTest ----
+if ($SelfTest) {
+    Write-Host ('Dev Mover GUI v{0} - self test' -f $script:Version)
+    try {
+        Load-Window
+    } catch {
+        Write-Host ('FAIL: ' + $_.Exception.Message)
+        exit 1
+    }
+    Write-Host ('XAML    : {0}' -f $script:XamlPath)
+    Write-Host ('Engine  : {0}  exists={1}' -f $script:EnginePath, (Test-Path -LiteralPath $script:EnginePath))
+    Write-Host 'Controls:'
+    foreach ($n in $script:ControlNames) {
+        Write-Host ('  {0} = {1}' -f $n, ($null -ne $script:Window.FindName($n)))
+    }
+    Write-Host 'Sources:'
+    foreach ($s in (Get-DefaultSources)) { Write-Host ('  [{0}] {1}  exists={2} junction={3} size={4}' -f $s.App, $s.Path, $s.Exists, $s.IsJunction, $s.SizeMB) }
+    Write-Host 'Drives:'
+    foreach ($d in (Get-FixedDrives)) { Write-Host ('  {0}  free {1} GB / {2} GB' -f $d.Root, $d.FreeGB, $d.TotalGB) }
+    Write-Host 'Self test OK.'
+    exit 0
+}
+
+# ---- main ----
+try {
+    Load-Window
+} catch {
+    Write-DebugLog ('main Load-Window EXCEPTION: ' + $_.Exception.Message)
+    [System.Windows.MessageBox]::Show('GUI 初始化失败: ' + $_.Exception.Message, '错误', [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error) | Out-Null
+    exit 1
+}
+
+# Global safety net: never let an unhandled exception silently kill the window.
+try {
+    [System.Windows.Application]::Current.add_DispatcherUnhandledException({
+        param($s, $e)
+        try {
+            Write-DebugLog ('UI EXCEPTION: ' + $e.Exception.Message)
+            $log = Join-Path $env:TEMP ('devmover-crash-{0}.log' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+            Add-Content -LiteralPath $log -Value ('UI EXCEPTION: ' + $e.Exception.ToString()) -Encoding UTF8
+            [System.Windows.MessageBox]::Show('界面遇到错误，详情已保存到: ' + $log, 'Dev Mover', [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error) | Out-Null
+        } catch { }
+        $e.Handled = $true
+    })
+} catch { }
+try {
+    [AppDomain]::CurrentDomain.add_UnhandledException({
+        param($s, $e)
+        try {
+            Write-DebugLog ('FATAL EXCEPTION: ' + $e.ExceptionObject.ToString())
+            $log = Join-Path $env:TEMP ('devmover-crash-{0}.log' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+            Add-Content -LiteralPath $log -Value ('FATAL: ' + $e.ExceptionObject.ToString()) -Encoding UTF8
+        } catch { }
+    })
+} catch { }
+
+$script:BtnGo.Add_Click({ Start-Migration -AsRestore $false })
+$script:BtnRestore.Add_Click({ Start-Migration -AsRestore $true })
+$script:BtnExit.Add_Click({ Write-DebugLog 'BtnExit clicked'; $script:Window.Close() })
+$script:BtnRefresh.Add_Click({ Refresh-Sources })
+$script:BtnAdd.Add_Click({
+    $p = $script:TxtCustom.Text.Trim()
+    if (-not $p) { return }
+    $item = Get-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue
+    if (-not $item) {
+        [System.Windows.MessageBox]::Show('路径不存在: ' + $p, '提示', [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null
+        return
+    }
+    foreach ($existing in $script:SrcList.Items) { if ($existing.Tag.Path -eq $p) { return } }
+    $name = Split-Path $p -Leaf
+    if (-not $name) { $name = 'custom' }
+    $bytes = (Get-ChildItem -LiteralPath $p -Recurse -Force -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
+    $size = if ($bytes) { [math]::Round($bytes / 1MB, 1) } else { 0 }
+    $obj = [PSCustomObject]@{ App = '自定义'; Path = $p; Name = $name; Exists = $true; IsJunction = $false; SizeMB = $size; Label = ('{0}   [{1} MB]' -f $p, $size) }
+    [void]$script:SrcList.Items.Add((New-SourceCheckBox -Source $obj -Checked $true))
+    $script:TxtCustom.Clear()
+})
+$script:DriveCombo.Add_SelectionChanged({ Update-RootPreview })
+$script:FolderBox.Add_TextChanged({ Update-RootPreview })
+$script:Window.Add_Closing({
+    param($s, $e)
+    Write-DebugLog ("closing event, running={0}" -f $script:running)
+    if ($script:running) { $e.Cancel = $true }
+})
+$script:Window.Add_Loaded({ Init-UI })
+
+[void]$script:Window.ShowDialog()
+Write-DebugLog 'ShowDialog returned'
+exit 0
