@@ -3,9 +3,9 @@ setlocal
 chcp 65001 >nul
 cd /d "%~dp0"
 echo ================================================================
-echo   Dev Mover v1.0.0 - portable edition
-echo   Move TRAE CN / WorkBuddy / VS Code / Claude Code data
-echo   off a full drive to another disk
+echo   Dev Mover v1.1.0 - portable edition
+echo   Move OpenAI Codex / TRAE CN / WorkBuddy / VS Code /
+echo   Claude Code data off a full drive to another disk
 echo ================================================================
 echo.
 echo  IMPORTANT: fully quit the target apps first

@@ -2,11 +2,11 @@
 
 便携版 Windows 工具 / Portable Windows tool
 
-把 **TRAE CN、WorkBuddy、VS Code、Claude Code** 的数据与工作区从爆满的 C 盘迁移到另一个盘（如 G 盘）。原路径保留为**目录联接（junction）**，所有工具无需任何配置即可继续工作。全程带备份、逐项校验与自动回滚。
+把 **OpenAI Codex、TRAE CN、WorkBuddy、VS Code、Claude Code** 的数据与工作区从爆满的 C 盘迁移到另一个盘（如 G 盘）。原路径保留为**目录联接（junction）**，所有工具无需任何配置即可继续工作。全程带备份、逐项校验与自动回滚。
 
-Move TRAE CN / WorkBuddy / VS Code / Claude Code data and workspace folders off a full C: drive to another drive. Original paths stay valid as directory junctions, so every tool keeps working without configuration changes. Every step is backed up, verified, and rolled back on failure.
+Move OpenAI Codex / TRAE CN / WorkBuddy / VS Code / Claude Code data and workspace folders off a full C: drive to another drive. Original paths stay valid as directory junctions, so every tool keeps working without configuration changes. Every step is backed up, verified, and rolled back on failure.
 
-> 本工具参照 [codex-mover](https://github.com/ZhaowTao/codex-mover) 的设计实现，把迁移对象换成了上面四个开发工具。
+> 本工具参照 [codex-mover](https://github.com/ZhaowTao/codex-mover) 的设计实现：保留其 OpenAI Codex 迁移能力，并额外支持 TRAE CN / WorkBuddy / VS Code / Claude Code。
 
 ## 迁移内容 / What gets moved
 
@@ -14,6 +14,11 @@ Move TRAE CN / WorkBuddy / VS Code / Claude Code data and workspace folders off 
 
 | 应用 | C: 路径 | 说明 |
 | --- | --- | --- |
+| OpenAI Codex | `%USERPROFILE%\.codex` | Codex CLI：会话记录、配置、登录凭证 |
+| OpenAI Codex | `%USERPROFILE%\.cache\codex-runtimes` | Codex 运行时缓存（体积可能很大） |
+| OpenAI Codex | `%LOCALAPPDATA%\OpenAI\Codex` | Codex 桌面应用数据 |
+| OpenAI Codex | `%APPDATA%\Codex` | Codex 应用漫游数据 |
+| OpenAI Codex | `Documents\Codex`（我的文档内） | Codex 文档与工作区 |
 | TRAE CN | `%APPDATA%\Trae CN` | 用户数据：设置、缓存、AI 对话记录（ModularData）、日志 |
 | TRAE CN | `%USERPROFILE%\.trae` | 扩展（extensions）、CLI 数据 |
 | WorkBuddy | `%USERPROFILE%\Tencent WorkBuddy` | 默认工作区：任务文件、历史工作空间 |
@@ -34,7 +39,7 @@ Move TRAE CN / WorkBuddy / VS Code / Claude Code data and workspace folders off 
 
 1. 双击 `DevMover-GUI.cmd` 启动向导。
 2. 勾选要迁移的目录、选择目标盘（默认目标文件夹 `DevData`）。
-3. 正式迁移前需完全退出 TRAE CN、WorkBuddy、VS Code 和 Claude Code（含托盘图标）；只想预览的话勾选「演练模式」即可，无需关闭应用。
+3. 正式迁移前需完全退出 OpenAI Codex、TRAE CN、WorkBuddy、VS Code 和 Claude Code（含托盘图标）；只想预览的话勾选「演练模式」即可，无需关闭应用。
 4. 点击「开始迁移」，日志实时滚动；右上角状态徽章变绿「完成」后即可重新打开各应用。
 
 ### 命令行 / Console
@@ -92,7 +97,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\dev-mover.ps1 -TargetRoot 
 ## 注意事项 / Notes
 
 - 仅 Windows（Windows 10/11，Windows PowerShell 5.1 与 .NET Framework 4.x 自带支持）。
-- Claude Code 也可以用 `CLAUDE_CONFIG_DIR` 环境变量方案替代联接，但目录联接对四个工具是统一的通用方案，无需逐个配置。
+- Claude Code 也可以用 `CLAUDE_CONFIG_DIR` 环境变量方案替代联接，但目录联接对所有工具是统一的通用方案，无需逐个配置。
 - VS Code 官方另有 `--user-data-dir` / `--extensions-dir` 启动参数方案；junction 方案无需改快捷方式。
 - WorkBuddy 升级时提示「应用安装目录下存在用户项目目录」属于安装目录问题，与本工具迁移的工作区无关。
 - 迁移后先保留 `G:\DevData\_backup-*` 几天，确认稳定后再删除。

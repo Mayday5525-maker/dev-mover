@@ -10,7 +10,7 @@
   asynchronously so the UI never freezes.
 
   Features:
-    - default source folders for TRAE CN / WorkBuddy / VS Code / Claude Code
+    - default source folders for OpenAI Codex / TRAE CN / WorkBuddy / VS Code / Claude Code
       plus custom source paths
     - target drive/folder with live preview
     - backup / auto-close / dry-run options
@@ -35,7 +35,7 @@ Add-Type -AssemblyName PresentationCore
 Add-Type -AssemblyName WindowsBase
 Add-Type -AssemblyName System.Xaml
 
-$script:Version = '1.0.0'
+$script:Version = '1.1.0'
 $script:EnginePath = Join-Path $PSScriptRoot 'dev-mover.ps1'
 $script:XamlPath = Join-Path $PSScriptRoot 'DevMover-GUI.xaml'
 $script:Window = $null
@@ -67,6 +67,14 @@ Write-DebugLog ('GUI v{0} start (SelfTest={1} TestMode={2})' -f $script:Version,
 
 function Get-DefaultSources {
     $specs = @(
+        @{ App = 'OpenAI Codex'; Path = Join-Path $env:USERPROFILE '.codex';                Name = '.codex' }
+        @{ App = 'OpenAI Codex'; Path = Join-Path $env:USERPROFILE '.cache\codex-runtimes'; Name = 'codex-runtimes' }
+        @{ App = 'OpenAI Codex'; Path = Join-Path $env:LOCALAPPDATA 'OpenAI\Codex';         Name = 'OpenAI-Codex-Local' }
+        @{ App = 'OpenAI Codex'; Path = Join-Path $env:APPDATA 'Codex';                     Name = 'Codex-Roaming' }
+    )
+    $myDocs = [Environment]::GetFolderPath('MyDocuments')
+    if ($myDocs) { $specs += @{ App = 'OpenAI Codex'; Path = (Join-Path $myDocs 'Codex'); Name = 'Documents-Codex' } }
+    $specs += @(
         @{ App = 'TRAE CN';     Path = Join-Path $env:APPDATA 'Trae CN';                  Name = 'TraeCN-Roaming' }
         @{ App = 'TRAE CN';     Path = Join-Path $env:USERPROFILE '.trae';                Name = '.trae' }
         @{ App = 'WorkBuddy';   Path = Join-Path $env:USERPROFILE 'Tencent WorkBuddy';    Name = 'Tencent-WorkBuddy' }
@@ -229,7 +237,7 @@ function Complete-Run {
     if ($ExitCode -eq 0) {
         Set-Status '完成' 'ok'
         if (-not $script:IsRestore -and -not $script:IsDryRun) {
-            [System.Windows.MessageBox]::Show('迁移完成。可以重新打开 TRAE CN、WorkBuddy、VS Code 和 Claude Code 了。' + [Environment]::NewLine + '备份保留在目标盘 _backup-* 文件夹中，建议保留几天再删除。', '完成', [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null
+            [System.Windows.MessageBox]::Show('迁移完成。可以重新打开 OpenAI Codex、TRAE CN、WorkBuddy、VS Code 和 Claude Code 了。' + [Environment]::NewLine + '备份保留在目标盘 _backup-* 文件夹中，建议保留几天再删除。', '完成', [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null
         }
     } else {
         Set-Status '未完成，请查看日志' 'err'
@@ -340,7 +348,7 @@ function Start-Migration {
                 return
             }
             if (-not $script:CbDryRun.IsChecked) {
-                $answer = [System.Windows.MessageBox]::Show('确定开始迁移到 ' + $targetRoot + ' 吗？' + [Environment]::NewLine + '请确认已完全退出 TRAE CN、WorkBuddy、VS Code 和 Claude Code（或勾选了自动关闭）。', '确认', [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Question)
+                $answer = [System.Windows.MessageBox]::Show('确定开始迁移到 ' + $targetRoot + ' 吗？' + [Environment]::NewLine + '请确认已完全退出 OpenAI Codex、TRAE CN、WorkBuddy、VS Code 和 Claude Code（或勾选了自动关闭）。', '确认', [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Question)
                 if ($answer -ne [System.Windows.MessageBoxResult]::Yes) { return }
             }
             $args = '-TargetRoot "' + $targetRoot + '" -SourcesFile "' + $jsonPath + '"'

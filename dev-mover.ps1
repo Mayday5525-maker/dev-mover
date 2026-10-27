@@ -1,9 +1,9 @@
 #Requires -Version 5.0
 <#
 .SYNOPSIS
-  Dev Mover - migrate TRAE CN / WorkBuddy / VS Code / Claude Code data and workspace
-  folders off a full drive to another drive using directory junctions, with backup,
-  verification, and rollback.
+  Dev Mover - migrate OpenAI Codex / TRAE CN / WorkBuddy / VS Code / Claude Code
+  data and workspace folders off a full drive to another drive using directory
+  junctions, with backup, verification, and rollback.
 
 .DESCRIPTION
   For each source folder this script:
@@ -22,6 +22,11 @@
   (check the system tray too) before running it.
 
   Default sources (skip automatically if missing):
+    OpenAI Codex %USERPROFILE%\.codex                  Codex CLI: sessions, config, auth
+                 %USERPROFILE%\.cache\codex-runtimes   Codex runtime cache (can be huge)
+                 %LOCALAPPDATA%\OpenAI\Codex           Codex desktop app data
+                 %APPDATA%\Codex                      Codex app roaming data
+                 Documents\Codex                      Codex documents and workspace
     TRAE CN      %APPDATA%\Trae CN                    settings, cache, chat records, logs
                  %USERPROFILE%\.trae                  extensions and CLI data
     WorkBuddy    %USERPROFILE%\Tencent WorkBuddy      default workspace, task files
@@ -37,7 +42,7 @@
 
 .PARAMETER Sources
   Hashtable mapping source path -> destination folder name. Defaults to the
-  TRAE CN / WorkBuddy / VS Code / Claude Code data folders.
+  OpenAI Codex / TRAE CN / WorkBuddy / VS Code / Claude Code data folders.
 
 .PARAMETER Backup
   Keep a verified backup of the original data on the target drive. Default: on.
@@ -95,7 +100,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:DevMoverVersion = '1.0.0'
+$script:DevMoverVersion = '1.1.0'
 $script:RunStamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $script:LogPath = $null
 $script:Ok = @()
@@ -103,7 +108,7 @@ $script:Fail = @()
 
 if ($Version) {
     Write-Host ('Dev Mover v{0}' -f $script:DevMoverVersion)
-    Write-Host 'Migrate TRAE CN / WorkBuddy / VS Code / Claude Code data off a full drive.'
+    Write-Host 'Migrate OpenAI Codex / TRAE CN / WorkBuddy / VS Code / Claude Code data off a full drive.'
     exit 0
 }
 
@@ -200,21 +205,34 @@ function Remove-Junction {
 
 function Get-SourceMap {
     if ($Sources.Count -gt 0) { return $Sources }
-    return [ordered]@{
-        (Join-Path $env:APPDATA 'Trae CN')                  = 'TraeCN-Roaming'
-        (Join-Path $env:USERPROFILE '.trae')                = '.trae'
-        (Join-Path $env:USERPROFILE 'Tencent WorkBuddy')    = 'Tencent-WorkBuddy'
-        (Join-Path $env:APPDATA 'CodeBuddyExtension')       = 'CodeBuddyExtension-Roaming'
-        (Join-Path $env:APPDATA 'Code')                      = 'VSCode-Roaming'
-        (Join-Path $env:USERPROFILE '.vscode')               = '.vscode'
-        (Join-Path $env:USERPROFILE '.claude')               = '.claude'
-        (Join-Path $env:USERPROFILE '.local\share\claude')   = 'local-share-claude'
-    }
+    $map = [ordered]@{}
+    # OpenAI Codex (same defaults as the original codex-mover)
+    $map[(Join-Path $env:USERPROFILE '.codex')]                = '.codex'
+    $map[(Join-Path $env:USERPROFILE '.cache\codex-runtimes')] = 'codex-runtimes'
+    $map[(Join-Path $env:LOCALAPPDATA 'OpenAI\Codex')]         = 'OpenAI-Codex-Local'
+    $map[(Join-Path $env:APPDATA 'Codex')]                     = 'Codex-Roaming'
+    # Documents\Codex is only added when the Documents folder resolves
+    # (it is always present on Windows; empty on some other platforms).
+    $myDocs = [Environment]::GetFolderPath('MyDocuments')
+    if ($myDocs) { $map[(Join-Path $myDocs 'Codex')] = 'Documents-Codex' }
+    # TRAE CN
+    $map[(Join-Path $env:APPDATA 'Trae CN')]                 = 'TraeCN-Roaming'
+    $map[(Join-Path $env:USERPROFILE '.trae')]               = '.trae'
+    # WorkBuddy
+    $map[(Join-Path $env:USERPROFILE 'Tencent WorkBuddy')]   = 'Tencent-WorkBuddy'
+    $map[(Join-Path $env:APPDATA 'CodeBuddyExtension')]      = 'CodeBuddyExtension-Roaming'
+    # VS Code
+    $map[(Join-Path $env:APPDATA 'Code')]                    = 'VSCode-Roaming'
+    $map[(Join-Path $env:USERPROFILE '.vscode')]              = '.vscode'
+    # Claude Code
+    $map[(Join-Path $env:USERPROFILE '.claude')]              = '.claude'
+    $map[(Join-Path $env:USERPROFILE '.local\share\claude')]  = 'local-share-claude'
+    return $map
 }
 
 function Get-DevProcesses {
     $result = New-Object System.Collections.Generic.List[object]
-    $namePattern = 'trae|workbuddy|codebuddy|claude|^code( -.*)?$'
+    $namePattern = 'trae|workbuddy|codebuddy|claude|codex|^code( -.*)?$'
     $all = @(Get-Process -ErrorAction SilentlyContinue)
     foreach ($p in $all) {
         $match = $false
@@ -278,7 +296,7 @@ function Show-Summary {
 
 Write-Log '=============================================================='
 Write-Log (" Dev Mover v{0} - migrate dev tool data to another drive" -f $script:DevMoverVersion)
-Write-Log (" Targets : TRAE CN / WorkBuddy / VS Code / Claude Code")
+Write-Log (" Targets : OpenAI Codex / TRAE CN / WorkBuddy / VS Code / Claude Code")
 Write-Log (" Run stamp : {0}" -f $script:RunStamp)
 Write-Log '=============================================================='
 
